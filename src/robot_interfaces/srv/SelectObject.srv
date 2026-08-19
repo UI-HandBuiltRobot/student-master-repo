@@ -1,0 +1,5 @@
+# Request (empty — node picks from its latest cached YOLO frame)
+---
+# Response
+bool success
+robot_interfaces/ImgDetectionData selected_obj

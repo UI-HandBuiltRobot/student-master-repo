@@ -1,0 +1,8 @@
+# Mirrors XARMController.set_joint_state(position_vector, servo_ids,
+# duration_vector, radians). duration_vector empty means "use default".
+float32[] angles
+int32[]   servo_ids
+float32[] duration_vector
+bool      radians
+---
+bool success

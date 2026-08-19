@@ -1,0 +1,6 @@
+ultralytics==8.4.118
+nvidia-modelopt[onnx]>=0.44
+onnxslim>=0.1.82
+polygraphy
+onnx-graphsurgeon
+

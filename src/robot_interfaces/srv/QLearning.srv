@@ -1,0 +1,9 @@
+# Request
+int32 id
+float32 aspect_ratio
+int32 attempt_number
+
+---
+# Response
+bool success
+float32 wrist_angle

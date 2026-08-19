@@ -1,0 +1,37 @@
+build/
+install/
+log/
+venv/
+.vscode/
+.vscode/settings.json
+runs/
+node_logs/
+src/usb_cam/
+venv_backup/
+Docs*
+docs*
+.graphifyignore
+graphify-out/
+venv_orig/
+
+# JS/TS build artifacts
+**/node_modules/
+**/dist/
+**/.npm/
+
+# Keep only deployable Foxglove artifact/docs from system_manager extension
+src/system_manager_package/foxglove_extensions/system_manager_panels/*
+!src/system_manager_package/foxglove_extensions/system_manager_panels/*.foxe
+!src/system_manager_package/foxglove_extensions/system_manager_panels/README.md
+!src/system_manager_package/foxglove_extensions/system_manager_panels/CHANGELOG.md
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+
+# OS-specific files
+.DS_Store
+*.swp

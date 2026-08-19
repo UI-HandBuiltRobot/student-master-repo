@@ -1,0 +1,5 @@
+# Mirrors XARMController.move_joint(joint_number, angle, wait=True).
+int32   joint_index
+float32 angle_deg
+---
+bool success

@@ -1,0 +1,108 @@
+# =============================================================================
+# Requirements for PC (x86_64) — Ubuntu 22.04 / ROS 2 Humble
+# =============================================================================
+# Install with: pip install -r requirements.txt
+#
+# NOTE: ROS 2 packages (rclpy, geometry_msgs, etc.) must be installed via apt:
+#   sudo apt install ros-humble-rclpy ros-humble-geometry-msgs ...
+#   (or via rosdep: rosdep install --from-paths src -y)
+#
+# This file covers pure Python/pip dependencies only.
+
+# ── Core dependencies ───────────────────────────────────────────────────────
+numpy>=1.24,<2.0                    # core numerical library; torch/ultralytics need <2.0
+PyYAML>=5.4                         # YAML config parsing
+Pillow>=9.0                         # image handling (used by wskr/vision)
+typeguard>=4.0                      # required by generate-parameter-library-py
+
+# ── Computer Vision ─────────────────────────────────────────────────────────
+opencv-python>=4.8                  # cv2 bindings (also install libopencv-dev via apt)
+cv_bridge>=3.2                      # ROS image msg <-> OpenCV (install via apt: ros-humble-cv-bridge)
+
+# ── Machine Learning / Inference ────────────────────────────────────────────
+torch>=2.0                          # PyTorch (install from https://pytorch.org/ for CUDA support)
+torchvision>=0.15                   # torchvision (must match torch version)
+ultralytics>=8.0                    # YOLO inference
+ultralytics-thop>=2.0               # FLOPs counter for ultralytics
+lap>=0.5.12
+inference-sdk==0.42.1               # For Q-learning
+
+# ── Scientific Computing ────────────────────────────────────────────────────
+scipy>=1.10                        # interpolation (CubicSpline), Q-learning, GA
+matplotlib>=3.5                     # optional: GA plotting, visualization
+
+
+# ── Serial / Hardware ───────────────────────────────────────────────────────
+pyserial>=3.5                      # Arduino serial bridge
+hidapi>=0.15                       # USB HID for whisker sensor board
+
+# ── xARM Hardware ──────────────────────────────────────────────────────────
+xarm>=0.0.4                        # UFactory xArm SDK
+
+# ── GStreamer (Vision Pipeline) ─────────────────────────────────────────────
+# PyGObject (gi) - install via apt recommended:
+#   sudo apt install python3-gi python3-gst-1.0 gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
+# (pip install is possible but trickier due to GObject introspection)
+
+setuptools>=30.3.0,<80
+
+# ── ROS 2 / colcon build tooling ────────────────────────────────────────────
+# Required ONLY if you build the workspace (colcon build) with this venv
+# active, so that generated ament_python entry-point scripts get a shebang
+# pointing at this venv's interpreter. If your venv was created with
+# --system-site-packages, check first whether these already resolve from
+# /opt/ros/humble before installing here:
+#   python3 -c "import catkin_pkg; print(catkin_pkg.__file__)"
+# Versions below match the official ROS 2 Humble source-install requirements.
+catkin_pkg>=0.5.2                  # parses package.xml
+empy==3.3.4                        # PINNED — empy 4.x breaks ament/colcon templating
+lark==1.1.1                        # PINNED — parsing used by colcon extensions
+importlib-metadata>=6.0            # entry-point loading (Python <3.10 compat)
+colcon-common-extensions>=0.3.0    # colcon + ament_python/cmake build verbs
+
+
+############################
+### ROBOSIM REQUIREMENTS ###
+############################
+
+pygame
+gymnasium
+
+
+##############################################################################
+################ FULL SYSTEM TEST WAS RUN JUST ON PART ABOVE. ################
+###### PART ON BOTTOM IS SUPPOSED TO BE FOR OTHER TOOLS LIKE GA IMAGES #######
+########## IF ANYTHING BREAKS, ASSUME PACKAGES BELOW ARE THE ISSUE ###########
+##############################################################################
+
+
+
+
+# ── Data Analysis & Science ─────────────────────────────────────────────────
+pandas==2.3.3                      # data manipulation
+scikit-learn==1.7.2                 # machine learning utilities
+joblib==1.5.2                       # parallel processing/serialization
+
+# ── Web & Networking ────────────────────────────────────────────────────────
+requests==2.32.5                   # HTTP requests
+httpx==0.28.1                       # Async HTTP client
+urllib3==2.5.0                      # HTTP client
+python-dotenv==1.1.1                # .env file support
+
+# ── Visualization Sub-dependencies ──────────────────────────────────────────
+fonttools==4.60.1                   # font manipulation for matplotlib
+kiwisolver==1.4.9                   # constraint solver for matplotlib
+cycler==0.12.1                      # property cycle for matplotlib
+
+# ── Performance & Progress Utilities ────────────────────────────────────────
+psutil==7.1.0                       # system monitoring
+tqdm==4.67.1                        # progress bars
+
+# ── CLI & Development Tools ─────────────────────────────────────────────────
+rich==14.2.0                        # pretty terminal output
+argcomplete==3.6.3                  # bash completion for python scripts
+pre-commit==4.6.0                   # git hooks
+
+# ── Optional / Development ──────────────────────────────────────────────────
+# pytest                           # testing (optional)
+# ipython                         # interactive debugging (optional)

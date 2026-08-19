@@ -1,0 +1,11 @@
+# Mirrors XARMController.play_waypoints_dense(waypoints, servo_ids, cancel_check).
+# waypoints is row-major flattened: rows = len(waypoints_flat) / cols.
+# Each column corresponds to the servo at the same index in servo_ids.
+float32[] waypoints_flat
+int32     cols
+int32[]   servo_ids
+---
+bool success
+---
+# Optional progress in [0, 1].
+float32 progress

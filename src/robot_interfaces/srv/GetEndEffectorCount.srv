@@ -1,0 +1,4 @@
+# Mirrors XARMController.get_end_effector_count().
+---
+float32 count
+bool    success

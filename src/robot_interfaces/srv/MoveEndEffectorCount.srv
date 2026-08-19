@@ -1,0 +1,4 @@
+# Mirrors XARMController.move_end_effector_count(count).
+float32 count
+---
+bool success

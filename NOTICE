@@ -1,0 +1,25 @@
+This product includes software from the following sources:
+
+- xArm manipulation modules (including genetic algorithm and Q-learning components), based on work from
+  "Artificial Intelligence for Robotics (2nd Edition)" by Packt Publishing
+  (https://github.com/PacktPublishing/Artificial-Intelligence-for-Robotics-2e).
+  Original work modified and adapted for ROS 2 integration.
+  Licensed under the Apache License 2.0.
+
+- roboflow_to_yolo.py, based on the Roboflow dataset download example from
+  "Artificial Intelligence for Robotics (2nd Edition)" by Packt Publishing
+  (https://github.com/PacktPublishing/Artificial-Intelligence-for-Robotics-2e).
+  Modified to match this project's dataset.
+
+- xarm-yolo controller by Umair Cheema (cheemzgpt@gmail.com)
+  Source: https://github.com/umairacheema/xarm-yolo
+  Licensed under the Apache License 2.0.
+
+- usb_cam: ROS 2 USB Camera Driver
+  Source: https://github.com/ros-drivers/usb_cam
+  Licensed under the BSD 3-Clause License
+
+# Optional attribution (uncomment if xarm_model.py is used from xarm-yolo)
+# - xarm_model.py from xarm-yolo by Umair Cheema (cheemzgpt@gmail.com)
+#   Source: https://github.com/umairacheema/xarm-yolo
+#   Licensed under the Apache License 2.0.

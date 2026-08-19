@@ -1,0 +1,8 @@
+# Foxglove-friendly wrapper for the XArm grasp action. Mirrors the
+# XArm.action Goal fields so the dashboard can dispatch a grasp using
+# a detection id + full ImgDetectionData payload.
+int32 id
+robot_interfaces/ImgDetectionData selected_obj
+---
+bool accepted       # true if the action server accepted the goal
+string message
