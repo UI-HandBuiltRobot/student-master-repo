@@ -4,7 +4,7 @@
     "robot_interfaces",
     "utilities"
   ],
-  "copied_files": 74,
+  "copied_files": 83,
   "never_publish": [
     "robot_description",
     "xarm_sim"
@@ -22,11 +22,11 @@
     "xarm_sim"
   ],
   "packages_selected": [
-    "arduino",
     "robot_config",
     "robot_interfaces",
-    "utilities"
+    "utilities",
+    "vision_processing_package"
   ],
-  "stage_name": "project-1",
+  "stage_name": "project-2",
   "stripped_files": 1
 }

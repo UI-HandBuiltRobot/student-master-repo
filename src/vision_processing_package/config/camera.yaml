@@ -1,0 +1,38 @@
+# CAMERA YAML CONFIG FILE
+# Calibration file for camera pipelines (including gstreamer_camera) when camera_info is used
+# Common file, not currently consumed in the default pipeline but kept for future use
+# Supresses error from the launch file that says a config file cannot be found 
+
+image_width: 1920
+image_height: 1080
+camera_name: camera
+
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [2273.1535159853333, 0.0, 894.0908771180291,
+         0.0, 2024.3769923726368, 534.9134267755802,
+         0.0, 0.0, 1.0]
+
+distortion_model: plumb_bob
+
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [-1.6850662516330235, 1.6873858646797855,
+         -0.013615803728416294, -0.01320605122652239,
+         0.7291161308583802]
+
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [2273.1535159853333, 0.0, 894.0908771180291, 0.0,
+         0.0, 2024.3769923726368, 534.9134267755802, 0.0,
+         0.0, 0.0, 1.0, 0.0]

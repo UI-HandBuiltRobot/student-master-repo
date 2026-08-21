@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""Object selection: (class priority, -y) -> best single detection.
+
+Subscribes to ``vision/yolo/detections`` and caches the latest frame.
+Exposes the selection two ways:
+
+  1. ``select_object_service`` (SelectObject, trigger-style) — returns the
+     best pick from the most recent cached YOLO frame.  The state_manager
+     calls this during the SELECT state.
+  2. ``vision/selected_object`` (continuous stream) — republishes the
+     current best pick on every incoming frame for dashboard overlays.
+"""
+from typing import Optional
+import rclpy
+from geometry_msgs.msg import Point
+from rclpy.node import Node
+from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from robot_interfaces.msg import ImgDetectionData
+from robot_interfaces.srv import SelectObject
+
+from robot_config.constants import (
+    SELECTION_CLASS_PRIORITIES,
+    SELECTION_MIN_CONFIDENCE,
+)
+
+
+STREAM_QOS = QoSProfile(
+    reliability=ReliabilityPolicy.BEST_EFFORT,
+    history=HistoryPolicy.KEEP_LAST,
+    depth=1,
+)
+
+
+class ObjectSelection(Node):
+    def __init__(self):
+        super().__init__('object_selection_node')
+
+        self.declare_parameter(
+            'class_priorities',
+            list(SELECTION_CLASS_PRIORITIES),
+        )
+        self.declare_parameter('min_confidence', SELECTION_MIN_CONFIDENCE)
+
+        self.class_priorities = [
+            str(c) for c in self.get_parameter('class_priorities').value
+        ]
+        self.min_confidence = float(self.get_parameter('min_confidence').value)
+
+        self._latest_detections: Optional[ImgDetectionData] = None
+
+        self.srv = self.create_service(
+            SelectObject, 'select_object_service', self._handle_select_service,
+        )
+
+        self.create_subscription(
+            ImgDetectionData, 'vision/yolo/detections',
+            self._on_detections, STREAM_QOS,
+        )
+        self.selected_pub = self.create_publisher(
+            ImgDetectionData, 'vision/selected_object', STREAM_QOS,
+        )
+
+        self.get_logger().info(
+            f"ObjectSelection ready (priorities={self.class_priorities}, "
+            f"min_confidence={self.min_confidence:.2f}). "
+            "Service: select_object_service; stream: vision/selected_object."
+        )
+
+    # ------------------------------------------------------------ helpers
+
+    def _priority_rank(self, class_name: str) -> int:
+        try:
+            return self.class_priorities.index(class_name)
+        except ValueError:
+            return len(self.class_priorities)
+
+    def _pick_best(self, detections: ImgDetectionData) -> Optional[int]:
+        #########################################
+        ######## STUDENTS TO IMPLEMENT ########
+        #########################################
+
+    def _extract_single(
+        self, detections: ImgDetectionData, idx: int,
+    ) -> ImgDetectionData:
+        out = ImgDetectionData()
+        out.image_width = detections.image_width
+        out.image_height = detections.image_height
+        out.inference_time = detections.inference_time
+        out.x = [detections.x[idx]]
+        out.y = [detections.y[idx]]
+        out.width = [detections.width[idx]]
+        out.height = [detections.height[idx]]
+        out.class_name = [detections.class_name[idx]]
+        out.confidence = [detections.confidence[idx]]
+        out.aspect_ratio = (
+            [detections.aspect_ratio[idx]]
+            if idx < len(detections.aspect_ratio)
+            else [0.0]
+        )
+        out.detection_ids = (
+            [detections.detection_ids[idx]]
+            if idx < len(detections.detection_ids)
+            else ['']
+        )
+        out.distance = (
+            [detections.distance[idx]]
+            if idx < len(detections.distance)
+            else [0.0]
+        )
+        out.location = (
+            [detections.location[idx]]
+            if idx < len(detections.location)
+            else [Point()]
+        )
+        out.yaw = (
+            [detections.yaw[idx]]
+            if idx < len(detections.yaw)
+            else [0.0]
+        )
+        return out
+
+    # --------------------------------------------------------- subscription
+
+    def _on_detections(self, msg: ImgDetectionData) -> None:
+        """Cache the latest frame and publish the streaming selection."""
+        self._latest_detections = msg
+
+        idx = self._pick_best(msg)
+        if idx is None:
+            empty = ImgDetectionData()
+            empty.image_width = msg.image_width
+            empty.image_height = msg.image_height
+            self.selected_pub.publish(empty)
+            return
+        self.selected_pub.publish(self._extract_single(msg, idx))
+
+    # ------------------------------------------------------------- service
+
+    def _handle_select_service(self, _request, response):
+        """Pick the best object from the latest cached YOLO frame."""
+        if self._latest_detections is None:
+            self.get_logger().warn("SelectObject called but no detections received yet.")
+            response.success = False
+            return response
+
+        detections = self._latest_detections
+        self.get_logger().info(f"SelectObject service: n={len(detections.x)}")
+
+        idx = self._pick_best(detections)
+        if idx is None:
+            self.get_logger().warn(
+                f"No detection passed min_confidence={self.min_confidence:.2f}."
+            )
+            response.success = False
+            return response
+
+        selected = self._extract_single(detections, idx)
+        self.get_logger().info(
+            f"Selected idx={idx} class={selected.class_name[0]} "
+            f"y={selected.y[0]:.1f} conf={selected.confidence[0]:.2f} "
+            f"track_id={selected.detection_ids[0]}"
+        )
+        response.success = True
+        response.selected_obj = selected
+        return response
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ObjectSelection()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
