@@ -4,7 +4,7 @@
     "robot_interfaces",
     "utilities"
   ],
-  "copied_files": 86,
+  "copied_files": 90,
   "never_publish": [
     "robot_description",
     "xarm_sim"
@@ -25,8 +25,8 @@
     "robot_config",
     "robot_interfaces",
     "utilities",
-    "xarm_object_collector_package"
+    "wskr"
   ],
-  "stage_name": "project-3",
+  "stage_name": "project-4",
   "stripped_files": 0
 }

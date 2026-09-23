@@ -1,0 +1,588 @@
+"""ROS 2 autopilot node consuming the IL MLP trained by train_mlp.py.
+
+Loads a model_*.json (schema_version >= 2, normalization == "saturation")
+and drives geometry_msgs/Twist on WSKR/cmd_vel at a fixed rate.
+
+Inputs are cached from async subscriptions; inference runs on a timer so the
+publish cadence is decoupled from sensor jitter. If any required input is
+stale, the node publishes a zero Twist rather than feeding stale features
+into the network.
+
+Drop-in replacement for the inline control loop in
+approach_action_server.control_loop. Wire WSKR/autopilot/enable from the
+action server's start/stop callbacks if you want goal-gated activation.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import threading
+from collections import deque
+from pathlib import Path
+from typing import Dict, List, Optional
+import numpy as np
+import rclpy
+from ament_index_python.packages import get_package_share_directory
+from geometry_msgs.msg import Twist
+from rcl_interfaces.msg import ParameterDescriptor
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from std_msgs.msg import Bool, Float32, Float32MultiArray, String
+
+from robot_config.constants import (
+    AUTOPILOT_CONTROL_RATE_HZ,
+    AUTOPILOT_INPUT_FRESHNESS_S,
+    AUTOPILOT_MAX_ANGULAR_RPS,
+    AUTOPILOT_MAX_LINEAR_MPS,
+    AUTOPILOT_MODEL_FILENAME,
+    AUTOPILOT_PROXIMITY_MAX_MM,
+    AUTOPILOT_PROXIMITY_MIN_MM,
+    AUTOPILOT_PROXIMITY_SPEED_MAX,
+    AUTOPILOT_PROXIMITY_SPEED_MIN,
+    AUTOPILOT_SPEED_SCALE,
+    AUTOPILOT_STATE_DIM,
+    AUTOPILOT_WHISKER_COUNT,
+)
+
+
+class _LatestCache:
+    """Latest-value cache with monotonic-clock arrival timestamps."""
+
+    def __init__(self, clock) -> None:
+        self._clock = clock
+        self._values: Dict[str, object] = {}
+        self._stamps: Dict[str, float] = {}
+        self._lock = threading.Lock()
+
+    def put(self, key: str, value: object) -> None:
+        now = self._clock.now().nanoseconds * 1e-9
+        with self._lock:
+            self._values[key] = value
+            self._stamps[key] = now
+
+    def get(self, key: str) -> Optional[object]:
+        with self._lock:
+            return self._values.get(key)
+
+    def age_s(self, key: str) -> Optional[float]:
+        with self._lock:
+            ts = self._stamps.get(key)
+        if ts is None:
+            return None
+        return self._clock.now().nanoseconds * 1e-9 - ts
+
+
+class WskrAutopilot(Node):
+    def __init__(self) -> None:
+        super().__init__("wskr_autopilot")
+
+        self.declare_parameter("control_rate_hz", AUTOPILOT_CONTROL_RATE_HZ)
+        self.declare_parameter("input_freshness_s", AUTOPILOT_INPUT_FRESHNESS_S)
+        self.declare_parameter("max_linear_mps", AUTOPILOT_MAX_LINEAR_MPS)
+        self.declare_parameter("max_angular_rps", AUTOPILOT_MAX_ANGULAR_RPS)
+        self.declare_parameter(
+            "publish_zero_when_disabled",
+            True,
+            ParameterDescriptor(description="If false, simply stops publishing while disabled."),
+        )
+        self.declare_parameter("model_filename", AUTOPILOT_MODEL_FILENAME,)
+        self.declare_parameter(
+            "speed_scale",
+            AUTOPILOT_SPEED_SCALE,
+            ParameterDescriptor(
+                description=(
+                    "Scalar in [0, 1] applied to all model outputs (Vx, Vy, "
+                    "rotation_rate) before clamping. Updated live via "
+                    "WSKR/autopilot/speed_scale (Float32)."
+                )
+            ),
+        )
+        self.declare_parameter(
+            "proximity_max_mm",
+            AUTOPILOT_PROXIMITY_MAX_MM,
+            ParameterDescriptor(
+                description=(
+                    "Max distance (mm) at which proximity attenuation starts. "
+                    "At closest target-whisker >= this, attenuation = 1.0."
+                )
+            ),
+        )
+        self.declare_parameter(
+            "proximity_min_mm",
+            AUTOPILOT_PROXIMITY_MIN_MM,
+            ParameterDescriptor(
+                description=(
+                    "Min distance (mm) at which proximity attenuation bottoms out. "
+                    "Between min and max it ramps linearly."
+                )
+            ),
+        )
+        self.declare_parameter(
+            "proximity_speed_max",
+            AUTOPILOT_PROXIMITY_SPEED_MAX,
+            ParameterDescriptor(description="Drive speed scale at proximity_max_mm and beyond."),
+        )
+        self.declare_parameter(
+            "proximity_speed_min",
+            AUTOPILOT_PROXIMITY_SPEED_MIN,
+            ParameterDescriptor(description="Drive speed scale floor at proximity_min_mm and below."),
+        )
+
+        self._model_lock = threading.Lock()
+        self._loaded_model_path: str = ""
+        self._load_initial_model()
+
+        self.control_rate_hz = float(self.get_parameter("control_rate_hz").value)
+        self.input_freshness_s = float(self.get_parameter("input_freshness_s").value)
+        self.max_linear_mps = float(self.get_parameter("max_linear_mps").value)
+        self.max_angular_rps = float(self.get_parameter("max_angular_rps").value)
+        self.publish_zero_when_disabled = bool(self.get_parameter("publish_zero_when_disabled").value)
+        self.speed_scale = self._clamp01(float(self.get_parameter("speed_scale").value))
+        self.proximity_max_mm   = max(0.0, float(self.get_parameter("proximity_max_mm").value))
+        self.proximity_min_mm   = max(0.0, float(self.get_parameter("proximity_min_mm").value))
+        self.proximity_speed_max = self._clamp01(float(self.get_parameter("proximity_speed_max").value))
+        self.proximity_speed_min = self._clamp01(float(self.get_parameter("proximity_speed_min").value))
+
+        self.cache = _LatestCache(self.get_clock())
+        self.enabled = True  # default-on; flipped by /WSKR/autopilot/enable if wired
+
+        latched = QoSProfile(
+            depth=1,
+            reliability=QoSReliabilityPolicy.RELIABLE,
+            durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+            history=QoSHistoryPolicy.KEEP_LAST,
+        )
+
+        self.create_subscription(Float32MultiArray, "WSKR/whisker_lengths", self._on_whiskers, 10)
+        self.create_subscription(Float32MultiArray, "WSKR/target_whisker_lengths", self._on_target_whiskers, 10)
+        self.create_subscription(Float32, "WSKR/heading_to_target", self._on_heading, 10)
+        self.create_subscription(String, "WSKR/tracking_mode", self._on_tracking_mode, 10)
+        self.create_subscription(Bool, "WSKR/autopilot/enable", self._on_enable, latched)
+        self.create_subscription(Float32, "WSKR/autopilot/speed_scale", self._on_speed_scale, latched)
+        self.create_subscription(String, "WSKR/autopilot/model_filename", self._on_model_filename, latched)
+        self.create_subscription(
+            Float32MultiArray, "WSKR/autopilot/proximity_limits", self._on_proximity_limits, latched,
+        )
+
+        self.cmd_pub = self.create_publisher(Twist, "WSKR/cmd_vel", 10)
+        self.debug_pub = self.create_publisher(Float32MultiArray, "WSKR/autopilot/debug", 10)
+        self.status_pub = self.create_publisher(String, "WSKR/autopilot/status", 10)
+        self.active_model_pub = self.create_publisher(String, "WSKR/autopilot/active_model", latched)
+        self._publish_active_model()
+
+        period = 1.0 / max(1e-3, self.control_rate_hz)
+        self.create_timer(period, self._on_tick)
+
+        self.get_logger().info(
+            f"wskr_autopilot up: mode={self.mode}, memory_steps={self.memory_steps}, "
+            f"input_dim={self.input_dim}, output_dim={self.output_dim}, "
+            f"control_rate={self.control_rate_hz}Hz"
+        )
+
+    # ------------------------------------------------------------------ model
+
+    def _load_initial_model(self) -> None:
+        """Try the configured model, then fall back to any valid .json in the models dir."""
+        initial_path = self._resolve_model_path()
+        try:
+            self._apply_model(self._parse_model(initial_path), initial_path)
+            return
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().warn(f"Default model failed ({initial_path}): {exc}")
+
+        models_dir = Path(get_package_share_directory("wskr")) / "models"
+        for candidate in sorted(models_dir.glob("*.json")):
+            if candidate == initial_path:
+                continue
+            try:
+                self._apply_model(self._parse_model(candidate), candidate)
+                self.get_logger().info(f"Fell back to model: {candidate}")
+                return
+            except Exception:  # noqa: BLE001
+                continue
+
+        raise RuntimeError(
+            f"No valid model found in {models_dir}. "
+            f"Place at least one schema_version>=2 model JSON there."
+        )
+
+    def _resolve_model_path(self) -> Path:
+        filename = str(self.get_parameter("model_filename").value)
+        candidate = Path(filename)
+        if candidate.is_absolute():
+            return candidate
+        share = Path(get_package_share_directory("wskr"))
+        return share / "models" / filename
+
+    def _parse_model(self, path: Path) -> Dict[str, object]:
+        """Parse and validate a model JSON; returns a dict of fields to apply.
+
+        Raises on any structural problem so the caller can keep running on the
+        previously-loaded model.
+        """
+        self.get_logger().info(f"Parsing autopilot model: {path}")
+        with open(path, "r", encoding="utf-8") as f:
+            blob = json.load(f)
+
+        if int(blob.get("schema_version", 0)) < 2:
+            raise RuntimeError(
+                f"Model at {path} is schema_version<2; retrain with current train_mlp.py "
+                f"(saturation normalization with x_scale/y_scale baked in)."
+            )
+        if str(blob.get("normalization", "")) != "saturation":
+            raise RuntimeError(
+                f"Model at {path} uses normalization={blob.get('normalization')!r}; "
+                f"this node only supports 'saturation'."
+            )
+
+        output_layout = list(blob["output_layout"])
+        action_dim = len(output_layout)
+        output_dim = int(blob["output_dim"])
+        if action_dim != output_dim:
+            raise RuntimeError(
+                f"output_layout length ({action_dim}) != output_dim ({output_dim})"
+            )
+
+        input_dim = int(blob["input_dim"])
+        x_scale = np.asarray(blob["x_scale"], dtype=np.float64).reshape(-1)
+        y_scale = np.asarray(blob["y_scale"], dtype=np.float64).reshape(-1)
+        if x_scale.size != input_dim:
+            raise RuntimeError(f"x_scale size {x_scale.size} != input_dim {input_dim}")
+        if y_scale.size != output_dim:
+            raise RuntimeError(f"y_scale size {y_scale.size} != output_dim {output_dim}")
+
+        memory_steps = int(blob["memory_steps"])
+        input_signals = blob.get("input_signals", {})
+        past_action_order: List[str] = list(input_signals.get("past_action_slice_order", []))
+        if memory_steps > 1 and len(past_action_order) != action_dim:
+            raise RuntimeError(
+                f"past_action_slice_order ({past_action_order}) does not match "
+                f"action dim {action_dim}"
+            )
+
+        output_to_history_idx = (
+            [past_action_order.index(name) for name in output_layout]
+            if past_action_order
+            else list(range(action_dim))
+        )
+
+        return {
+            "mode": str(blob["mode"]),
+            "memory_steps": memory_steps,
+            "input_dim": input_dim,
+            "output_dim": output_dim,
+            "activation": str(blob["activation"]),
+            "output_layout": output_layout,
+            "action_dim": action_dim,
+            "weights": [np.asarray(w, dtype=np.float64) for w in blob["weights"]],
+            "biases": [np.asarray(b, dtype=np.float64) for b in blob["biases"]],
+            "x_scale": x_scale,
+            "y_scale": y_scale,
+            "past_action_order": past_action_order,
+            "output_to_history_idx": output_to_history_idx,
+        }
+
+    def _apply_model(self, fields: Dict[str, object], path: Path) -> None:
+        """Atomically swap parsed fields into self under the model lock."""
+        with self._model_lock:
+            for k, v in fields.items():
+                setattr(self, k, v)
+            # Recreate histories — maxlen depends on memory_steps which may have changed.
+            self.state_history = deque(maxlen=self.memory_steps)
+            self.action_history = deque(maxlen=max(1, self.memory_steps - 1))
+            self.last_action_physical = np.zeros(self.action_dim, dtype=np.float64)
+            self._loaded_model_path = str(path)
+        self.get_logger().info(
+            f"Model active: {path}  mode={self.mode}  memory_steps={self.memory_steps}  "
+            f"input_dim={self.input_dim}  output_dim={self.output_dim}"
+        )
+
+    # -------------------------------------------------------------- callbacks
+
+    def _on_whiskers(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) != AUTOPILOT_WHISKER_COUNT:
+            self.get_logger().warn_once(
+                f"WSKR/whisker_lengths len={len(msg.data)}, expected {AUTOPILOT_WHISKER_COUNT}"
+            )
+            return
+        self.cache.put("whiskers_mm", np.asarray(msg.data, dtype=np.float64))
+
+    def _on_target_whiskers(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) != AUTOPILOT_WHISKER_COUNT:
+            self.get_logger().warn_once(
+                f"WSKR/target_whisker_lengths len={len(msg.data)}, expected {AUTOPILOT_WHISKER_COUNT}"
+            )
+            return
+        self.cache.put("target_whiskers_mm", np.asarray(msg.data, dtype=np.float64))
+
+    def _on_heading(self, msg: Float32) -> None:
+        self.cache.put("heading_deg", float(msg.data))
+
+    def _on_tracking_mode(self, msg: String) -> None:
+        self.cache.put("tracking_mode", str(msg.data))
+
+    def _on_model_filename(self, msg: String) -> None:
+        raw = (msg.data or "").strip()
+        if not raw:
+            return
+        candidate = Path(raw)
+        if not candidate.is_absolute():
+            candidate = Path(get_package_share_directory("wskr")) / "models" / raw
+        if str(candidate) == self._loaded_model_path:
+            self.get_logger().info(f"Hot-swap no-op: {candidate} already active")
+            return
+        try:
+            fields = self._parse_model(candidate)
+        except Exception as exc:  # noqa: BLE001
+            self.get_logger().error(
+                f"Hot-swap failed; staying on {self._loaded_model_path}: {exc}"
+            )
+            self._publish_status(f"reload_failed: {exc}")
+            return
+        self._apply_model(fields, candidate)
+        self._publish_active_model()
+        self._publish_status("model_reloaded")
+
+    def _publish_active_model(self) -> None:
+        msg = String()
+        msg.data = self._loaded_model_path
+        self.active_model_pub.publish(msg)
+
+    def _on_speed_scale(self, msg: Float32) -> None:
+        new_scale = self._clamp01(float(msg.data))
+        if new_scale != self.speed_scale:
+            self.get_logger().info(f"speed_scale: {self.speed_scale:.2f} -> {new_scale:.2f}")
+            self.speed_scale = new_scale
+
+    def _on_proximity_limits(self, msg: Float32MultiArray) -> None:
+        if len(msg.data) < 2:
+            self.get_logger().warn(
+                f"WSKR/autopilot/proximity_limits expects [min_mm, max_mm] or "
+                f"[min_mm, max_mm, speed_at_min, speed_at_max]; got {list(msg.data)}"
+            )
+            return
+        new_min = max(0.0, float(msg.data[0]))
+        new_max = max(0.0, float(msg.data[1]))
+        if new_max < new_min:
+            self.get_logger().warn(
+                f"proximity_limits rejected: max_mm ({new_max}) < min_mm ({new_min})"
+            )
+            return
+        self.proximity_min_mm = new_min
+        self.proximity_max_mm = new_max
+        if len(msg.data) >= 4:
+            self.proximity_speed_min = self._clamp01(float(msg.data[2]))
+            self.proximity_speed_max = self._clamp01(float(msg.data[3]))
+        self.get_logger().info(
+            f"proximity_limits: min={new_min:.0f}mm @ {self.proximity_speed_min:.2f}  "
+            f"max={new_max:.0f}mm @ {self.proximity_speed_max:.2f}"
+        )
+
+    def _on_enable(self, msg: Bool) -> None:
+        self.enabled = bool(msg.data)
+        if not self.enabled:
+            # Drop history so a re-enable starts cleanly without stale actions.
+            self.state_history.clear()
+            self.action_history.clear()
+            self.last_action_physical = np.zeros(self.action_dim, dtype=np.float64)
+
+    # --------------------------------------------------------------- control
+
+    def _publish_status(self, status: str) -> None:
+        msg = String()
+        msg.data = status
+        self.status_pub.publish(msg)
+
+    def _publish_zero(self) -> None:
+        self.cmd_pub.publish(Twist())
+
+    def _on_tick(self) -> None:
+        if not self.enabled:
+            if self.publish_zero_when_disabled:
+                self._publish_zero()
+            self._publish_status("idle")
+            return
+
+        # Required inputs: both whisker channels + heading. Tracking mode is
+        # informational; absence does not gate inference (model was trained
+        # without it as a feature).
+        required = ("whiskers_mm", "target_whiskers_mm", "heading_deg")
+        for key in required:
+            age = self.cache.age_s(key)
+            if age is None or age > self.input_freshness_s:
+                self._publish_zero()
+                self._publish_status("stale_inputs")
+                # Drop history when we go stale so the next live tick rebuilds
+                # from fresh observations rather than mixing old + new state.
+                self.state_history.clear()
+                self.action_history.clear()
+                self.last_action_physical = np.zeros(self.action_dim, dtype=np.float64)
+                return
+
+        whiskers_mm = self.cache.get("whiskers_mm")
+        target_whiskers_mm = self.cache.get("target_whiskers_mm")
+        heading_deg = float(self.cache.get("heading_deg"))
+
+        # Convert mm -> m to match training units; the saturation x_scale then
+        # divides by WHISKER_MAX_M (0.50 m) to land in [0, 1].
+        #
+        # Ordering fix: wskr_range_node publishes whiskers sorted by label
+        # ascending [-90 … +90] (right-to-left), but the model was trained with
+        # whisker[0] = +90° (LEFT) … whisker[10] = -90° (RIGHT), i.e. left-to-right.
+        # Reverse both arrays here so the feature vector matches training layout.
+        # (model JSON: "angles_deg_left_to_right": [90, 60, 45, 30, 15, 0, -15, -30, -45, -60, -90])
+        whiskers_m = np.asarray(whiskers_mm, dtype=np.float64)[::-1] / 1000.0
+        target_whiskers_m = np.asarray(target_whiskers_mm, dtype=np.float64)[::-1] / 1000.0
+
+        state = np.concatenate(
+            [whiskers_m, target_whiskers_m, np.array([heading_deg], dtype=np.float64)]
+        )
+        if state.size != AUTOPILOT_STATE_DIM:
+            self.get_logger().error(f"state dim {state.size} != {AUTOPILOT_STATE_DIM}")
+            self._publish_zero()
+            return
+
+        # First fresh tick: pre-fill history with copies of the live state and
+        # zero-padded actions (matches HeadlessSimulator._reset_episode_state).
+        if not self.state_history:
+            for _ in range(self.memory_steps - 1):
+                self.state_history.append(state.copy())
+                self.action_history.append(np.zeros(self.action_dim, dtype=np.float64))
+            self.state_history.append(state.copy())
+        else:
+            self.state_history.append(state)
+
+        feature_vec = self._build_feature_vector()
+        if feature_vec.size != self.input_dim:
+            self.get_logger().error(
+                f"feature vec size {feature_vec.size} != input_dim {self.input_dim}"
+            )
+            self._publish_zero()
+            return
+
+        x_norm = feature_vec / np.where(np.abs(self.x_scale) < 1e-6, 1.0, self.x_scale)
+        y_norm = self._predict(x_norm.reshape(1, -1)).reshape(-1)
+        y_phys = y_norm * np.where(np.abs(self.y_scale) < 1e-6, 1.0, self.y_scale)
+
+        twist = self._physical_to_twist(y_phys)
+        self.cmd_pub.publish(twist)
+        self._publish_status("running")
+        self._publish_debug(y_phys)
+
+        # Record the action we just emitted into history (in past_action_order),
+        # so the next tick's feature vector reflects what the policy actually did.
+        action_in_history_order = np.zeros(self.action_dim, dtype=np.float64)
+        for out_idx, hist_idx in enumerate(self.output_to_history_idx):
+            action_in_history_order[hist_idx] = y_phys[out_idx]
+        self.action_history.append(action_in_history_order)
+        self.last_action_physical = y_phys
+
+    def _build_feature_vector(self) -> np.ndarray:
+        states = list(self.state_history)
+        actions = list(self.action_history)[: self.memory_steps - 1]
+        parts: List[np.ndarray] = []
+        for i, s in enumerate(states):
+            parts.append(s)
+            if i < len(actions):
+                parts.append(actions[i])
+        return np.concatenate(parts).astype(np.float64)
+
+    def _predict(self, x: np.ndarray) -> np.ndarray:
+        a = x
+        for i in range(len(self.weights) - 1):
+            z = a @ self.weights[i] + self.biases[i]
+            if self.activation == "tanh":
+                a = np.tanh(z)
+            elif self.activation == "leaky_relu":
+                a = np.where(z > 0.0, z, 0.01 * z)
+            else:
+                a = np.maximum(0.0, z)
+        return a @ self.weights[-1] + self.biases[-1]
+
+    def _physical_to_twist(self, y_phys: np.ndarray) -> Twist:
+        """Map model output (named by output_layout) onto a Twist.
+
+        rotation_rate is in deg/s coming out of the model; convert to rad/s
+        for angular.z. Linear components are in m/s and pass through.
+        """
+        named = {name: float(y_phys[i]) for i, name in enumerate(self.output_layout)}
+        scale = self.speed_scale
+        # Proximity attenuation — only applied to drive speed (linear.x/.y),
+        # not to rotation. Rotation-in-place is useful when close to the target.
+        drive_scale = scale * self._proximity_scale()
+        twist = Twist()
+        twist.linear.x = self._clamp(
+            drive_scale * named.get("drive_speed", named.get("vx", 0.0)),
+            -self.max_linear_mps,
+            self.max_linear_mps,
+        )
+        twist.linear.y = self._clamp(
+            drive_scale * named.get("vy", 0.0),
+            -self.max_linear_mps,
+            self.max_linear_mps,
+        )
+        rotation_dps = named.get("rotation_rate", 0.0)
+        twist.angular.z = self._clamp(
+            scale * math.radians(rotation_dps),
+            -self.max_angular_rps,
+            self.max_angular_rps,
+        )
+        return twist
+
+    def _proximity_scale(self) -> float:
+        """Linear ramp from proximity_speed_max at proximity_max_mm down to
+        proximity_speed_min at proximity_min_mm.
+
+        Uses the smallest value of the cached target_whisker_lengths (closest
+        ray hit on the target bbox). If the target isn't visible on any whisker
+        the array is all max-range and the ramp stays at proximity_speed_max.
+        """
+        tw = self.cache.get("target_whiskers_mm")
+        if tw is None:
+            return self.proximity_speed_max
+        d = float(np.min(np.asarray(tw)))
+        hi = self.proximity_max_mm
+        lo = self.proximity_min_mm
+        s_hi = self.proximity_speed_max
+        s_lo = self.proximity_speed_min
+        if hi <= lo or d >= hi:
+            return s_hi
+        if d <= lo:
+            return s_lo
+        return s_lo + (s_hi - s_lo) * (d - lo) / (hi - lo)
+
+    @staticmethod
+    def _clamp(v: float, lo: float, hi: float) -> float:
+        if v < lo:
+            return lo
+        if v > hi:
+            return hi
+        return v
+
+    @staticmethod
+    def _clamp01(v: float) -> float:
+        if v < 0.0:
+            return 0.0
+        if v > 1.0:
+            return 1.0
+        return v
+
+    def _publish_debug(self, y_phys: np.ndarray) -> None:
+        msg = Float32MultiArray()
+        msg.data = [float(v) for v in y_phys]
+        self.debug_pub.publish(msg)
+
+
+def main(args=None) -> None:
+    rclpy.init(args=args)
+    node = WskrAutopilot()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == "__main__":
+    main()
